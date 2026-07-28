@@ -14,10 +14,20 @@ Copies (source field -> destination field), only when the value differs:
    18 -> 30
    19 -> 31
 
+IMPORTANT: fields 13/18/19 are derived (summary/formula) fields computed
+over tens of thousands of child records each. They are expensive for
+Quickbase to compute. Do NOT batch-read many records' worth of these
+fields in a single query -- that's what caused a production outage.
+Records are read ONE AT A TIME with a delay between each (matching the
+original script's approach), even though writes are still batched
+(writes are cheap -- they're plain field sets, not derived calculations).
+
 Env vars (see .env.example):
    QB_REALM, QB_USER_TOKEN, QB_TABLE_ID
    QB_RECORD_ID_FID, QB_KEY_FID, QB_FIELD_MAP (JSON, optional override)
-   QB_PAGE_SIZE, QB_UPSERT_BATCH_SIZE, QB_MAX_RETRIES
+   QB_ID_PAGE_SIZE, QB_UPSERT_BATCH_SIZE, QB_MAX_RETRIES
+   QB_PER_RECORD_DELAY_MS   -- pacing delay between each expensive per-record read
+   QB_MAX_RUNTIME_MINUTES   -- safety cap; 0 disables (not recommended)
    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, EMAIL_TO
    DEBUG_HTTP (1/0)
 """
@@ -62,9 +72,23 @@ CONFIG = {
     "RECORD_ID_FID": _env_int("QB_RECORD_ID_FID", 3),
     "KEY_FID": _env_int("QB_KEY_FID", 8),
 
-    "PAGE_SIZE": _env_int("QB_PAGE_SIZE", 250),
+    # Paging for the cheap ID-only listing query (fine to be large -- it
+    # selects only the record ID field, not the expensive derived ones).
+    "ID_PAGE_SIZE": _env_int("QB_ID_PAGE_SIZE", 250),
+
+    # Writes are batched (cheap: plain field sets, not derived calculations).
     "UPSERT_BATCH_SIZE": _env_int("QB_UPSERT_BATCH_SIZE", 50),
     "MAX_RETRIES": _env_int("QB_MAX_RETRIES", 4),
+
+    # Reads of the derived fields happen ONE RECORD AT A TIME, paced by
+    # this delay, to avoid overloading Quickbase's formula/summary engine.
+    "PER_RECORD_DELAY_MS": _env_int("QB_PER_RECORD_DELAY_MS", 150),
+
+    # Safety cap: if the run exceeds this many minutes, stop cleanly,
+    # flush pending writes, and email a summary noting an early stop,
+    # rather than running indefinitely. 0 disables the cap (not recommended
+    # given tens of thousands of records at ~150ms/record).
+    "MAX_RUNTIME_MINUTES": _env_int("QB_MAX_RUNTIME_MINUTES", 45),
 
     "USER_AGENT": "QB-Railway-Snapshot/1.0",
     "DEBUG_HTTP": _env_bool("DEBUG_HTTP", False),
@@ -245,15 +269,30 @@ def unique_fids(fids: list[int]) -> list[int]:
             seen.append(f)
     return seen
 
-def fetch_page(table_id: str, select_fids: list[int], skip: int, top: int) -> list[dict]:
+def fetch_record_id_page(table_id: str, skip: int, top: int) -> tuple[list[int], int | None]:
+    """Cheap: selects only the record ID field. Returns (ids, total_records)."""
     body = {
         "from": table_id,
-        "select": select_fids,
+        "select": [CONFIG["RECORD_ID_FID"]],
         "sortBy": [{"fieldId": CONFIG["RECORD_ID_FID"], "order": "ASC"}],
         "options": {"skip": skip, "top": top},
     }
     resp = qb_fetch("POST", "/v1/records/query", body)
-    return resp.get("data", []) or []
+    ids = [get_value(row, CONFIG["RECORD_ID_FID"]) for row in resp.get("data", []) or []]
+    total = (resp.get("metadata", {}) or {}).get("totalRecords")
+    return [i for i in ids if i is not None], total
+
+def fetch_single_record(table_id: str, recid: Any, select_fids: list[int]) -> dict | None:
+    """Expensive: pulls the derived/summary fields for exactly one record."""
+    body = {
+        "from": table_id,
+        "select": select_fids,
+        "where": f"{{{CONFIG['RECORD_ID_FID']}.EX.'{recid}'}}",
+        "options": {"skip": 0, "top": 1},
+    }
+    resp = qb_fetch("POST", "/v1/records/query", body)
+    data = resp.get("data", []) or []
+    return data[0] if data else None
 
 def build_row_update_if_needed(record: dict, field_map: list[tuple[int, int]], stats: dict) -> list[dict] | None:
     recid = get_value(record, CONFIG["RECORD_ID_FID"])
@@ -356,44 +395,88 @@ def run():
         [CONFIG["RECORD_ID_FID"], CONFIG["KEY_FID"]] + [f for pair in CONFIG["FIELD_MAP"] for f in pair]
     )
     stats = fresh_stats()
+    stats["stopped_early"] = False
     skip = 0
     pending: list[list[dict]] = []
+    delay_s = CONFIG["PER_RECORD_DELAY_MS"] / 1000.0
+    max_runtime_s = CONFIG["MAX_RUNTIME_MINUTES"] * 60 if CONFIG["MAX_RUNTIME_MINUTES"] > 0 else None
+    started = time.monotonic()
 
-    info("Starting run", table=CONFIG["TABLE_ID"], field_map=CONFIG["FIELD_MAP"])
+    info("Starting run", table=CONFIG["TABLE_ID"], field_map=CONFIG["FIELD_MAP"],
+         per_record_delay_ms=CONFIG["PER_RECORD_DELAY_MS"],
+         max_runtime_minutes=CONFIG["MAX_RUNTIME_MINUTES"])
+
+    stopped_early = False
 
     while True:
-        page = fetch_page(CONFIG["TABLE_ID"], select_fids, skip, CONFIG["PAGE_SIZE"])
-        page_count = len(page)
+        ids, total = fetch_record_id_page(CONFIG["TABLE_ID"], skip, CONFIG["ID_PAGE_SIZE"])
+        page_count = len(ids)
         if page_count == 0:
             break
 
+        if skip == 0 and total is not None:
+            est_minutes = round((total * delay_s) / 60, 1)
+            info("Total records found", total_records=total,
+                 estimated_read_minutes=est_minutes)
+
         stats["found"] += page_count
 
-        for rec in page:
+        for recid in ids:
+            if max_runtime_s is not None and (time.monotonic() - started) > max_runtime_s:
+                warn("Max runtime reached; stopping early and flushing pending writes",
+                     elapsed_minutes=round((time.monotonic() - started) / 60, 1),
+                     processed_so_far=stats["processed"])
+                stopped_early = True
+                break
+
+            rec = None
+            try:
+                rec = fetch_single_record(CONFIG["TABLE_ID"], recid, select_fids)
+            except Exception as e:
+                stats["read_errors"] += 1
+                warn("Read failed for record; skipping", recid=recid, error=str(e))
+
+            if rec is None and stats["read_errors"] == 0:
+                # query succeeded but returned nothing (record deleted mid-run, etc.)
+                stats["read_errors"] += 1
+                warn("Record missing from per-record query", recid=recid)
+
             stats["processed"] += 1
-            update = build_row_update_if_needed(rec, CONFIG["FIELD_MAP"], stats)
-            if update:
-                cap_push(stats["samples"]["diffs"], {
-                    "recid": get_value(rec, CONFIG["RECORD_ID_FID"]),
-                    "key": get_value(rec, CONFIG["KEY_FID"]),
-                    "set": [c for c in update if c["fid"] != CONFIG["KEY_FID"]],
-                }, 10)
-                stats["queued"] += 1
-                pending.append(update)
-            else:
-                stats["unchanged"] += 1
+
+            if rec is not None:
+                update = build_row_update_if_needed(rec, CONFIG["FIELD_MAP"], stats)
+                if update:
+                    cap_push(stats["samples"]["diffs"], {
+                        "recid": get_value(rec, CONFIG["RECORD_ID_FID"]),
+                        "key": get_value(rec, CONFIG["KEY_FID"]),
+                        "set": [c for c in update if c["fid"] != CONFIG["KEY_FID"]],
+                    }, 10)
+                    stats["queued"] += 1
+                    pending.append(update)
+                else:
+                    stats["unchanged"] += 1
 
             if len(pending) >= CONFIG["UPSERT_BATCH_SIZE"]:
                 upsert_batch(pending, stats)
                 pending = []
 
+            if stats["processed"] % 250 == 0:
+                info("Progress", processed=stats["processed"],
+                     elapsed_minutes=round((time.monotonic() - started) / 60, 1))
+
+            time.sleep(delay_s)
+
+        if stopped_early:
+            break
+
         skip += page_count
-        if page_count < CONFIG["PAGE_SIZE"]:
+        if page_count < CONFIG["ID_PAGE_SIZE"]:
             break  # last page
 
     if pending:
         upsert_batch(pending, stats)
 
+    stats["stopped_early"] = stopped_early
     info("Run complete", **{k: v for k, v in stats.items() if k != "samples"})
     return stats
 
