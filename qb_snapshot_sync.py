@@ -28,7 +28,13 @@ Env vars (see .env.example):
    QB_ID_PAGE_SIZE, QB_UPSERT_BATCH_SIZE, QB_MAX_RETRIES
    QB_PER_RECORD_DELAY_MS   -- pacing delay between each expensive per-record read
    QB_MAX_RUNTIME_MINUTES   -- safety cap; 0 disables (not recommended)
-   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, EMAIL_TO
+   EMAIL_FROM, EMAIL_TO
+   RESEND_API_KEY           -- if set, email is sent via Resend's HTTP API (port 443,
+                                bypasses cloud-host SMTP port blocking entirely).
+                                Preferred over SMTP when available.
+   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_TIMEOUT_S
+                            -- fallback if RESEND_API_KEY is not set. Port 465 uses
+                                implicit SSL; any other port uses STARTTLS.
    DEBUG_HTTP (1/0)
 """
 
@@ -99,9 +105,11 @@ CONFIG = {
     "SMTP_PORT": _env_int("SMTP_PORT", 587),
     "SMTP_USER": os.environ.get("SMTP_USER", ""),
     "SMTP_PASS": os.environ.get("SMTP_PASS", ""),
+    "SMTP_TIMEOUT_S": _env_int("SMTP_TIMEOUT_S", 15),
     "EMAIL_FROM": os.environ.get("EMAIL_FROM", ""),
     "EMAIL_TO": os.environ.get("EMAIL_TO", "gene_bixler1@intuit.com"),
     "EMAIL_ON_COMPLETE": _env_bool("EMAIL_ON_COMPLETE", True),
+    "RESEND_API_KEY": os.environ.get("RESEND_API_KEY", ""),
 }
 
 # -------------------- Logging --------------------
@@ -372,9 +380,11 @@ class _force_ipv4_dns:
         return False
 
 def send_summary_email(stats: dict, failed: bool = False, error_msg: str | None = None):
-    if not CONFIG["SMTP_HOST"] or not CONFIG["EMAIL_FROM"]:
-        warn("SMTP not configured; skipping email", host_set=bool(CONFIG["SMTP_HOST"]),
-             from_set=bool(CONFIG["EMAIL_FROM"]))
+    if not CONFIG["EMAIL_FROM"]:
+        warn("EMAIL_FROM not configured; skipping email")
+        return
+    if not CONFIG["RESEND_API_KEY"] and not CONFIG["SMTP_HOST"]:
+        warn("Neither RESEND_API_KEY nor SMTP_HOST configured; skipping email")
         return
 
     status = "FAILED" if failed else "Updated"
@@ -396,18 +406,62 @@ def send_summary_email(stats: dict, failed: bool = False, error_msg: str | None 
       <div style="color:#666;margin-top:10px">QB-Railway-Snapshot v1</div>
     </div>"""
 
+    if CONFIG["RESEND_API_KEY"]:
+        _send_via_resend(subject, html)
+    else:
+        _send_via_smtp(subject, html)
+
+def _send_via_resend(subject: str, html: str):
+    """Send over HTTPS (port 443) via Resend's API -- avoids cloud-host SMTP
+    port blocking entirely, since it's the same kind of request the
+    Quickbase calls already make successfully."""
+    resp = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {CONFIG['RESEND_API_KEY']}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": CONFIG["EMAIL_FROM"],
+            "to": [CONFIG["EMAIL_TO"]],
+            "subject": subject,
+            "html": html,
+        },
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Resend API error {resp.status_code}: {safe_slice(resp.text, 500)}")
+    info("Summary email sent via Resend", to=CONFIG["EMAIL_TO"])
+
+def _send_via_smtp(subject: str, html: str):
     msg = MIMEText(html, "html")
     msg["Subject"] = subject
     msg["From"] = CONFIG["EMAIL_FROM"]
     msg["To"] = CONFIG["EMAIL_TO"]
 
-    with _force_ipv4_dns(), smtplib.SMTP(CONFIG["SMTP_HOST"], CONFIG["SMTP_PORT"], timeout=30) as server:
-        server.starttls()
-        if CONFIG["SMTP_USER"]:
-            server.login(CONFIG["SMTP_USER"], CONFIG["SMTP_PASS"])
-        server.sendmail(CONFIG["EMAIL_FROM"], [CONFIG["EMAIL_TO"]], msg.as_string())
+    port = CONFIG["SMTP_PORT"]
+    timeout = CONFIG["SMTP_TIMEOUT_S"]
 
-    info("Summary email sent", to=CONFIG["EMAIL_TO"])
+    with _force_ipv4_dns():
+        # Port 465 = implicit TLS from the start (SMTP_SSL). Any other port
+        # (587, 25, etc.) = plaintext connect then STARTTLS upgrade.
+        if port == 465:
+            server = smtplib.SMTP_SSL(CONFIG["SMTP_HOST"], port, timeout=timeout)
+        else:
+            server = smtplib.SMTP(CONFIG["SMTP_HOST"], port, timeout=timeout)
+        try:
+            if port != 465:
+                server.starttls()
+            if CONFIG["SMTP_USER"]:
+                server.login(CONFIG["SMTP_USER"], CONFIG["SMTP_PASS"])
+            server.sendmail(CONFIG["EMAIL_FROM"], [CONFIG["EMAIL_TO"]], msg.as_string())
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
+
+    info("Summary email sent via SMTP", to=CONFIG["EMAIL_TO"], port=port)
 
 # -------------------- Main run --------------------
 
