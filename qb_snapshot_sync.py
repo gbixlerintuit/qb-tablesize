@@ -37,6 +37,7 @@ import logging
 import os
 import random
 import smtplib
+import socket
 import sys
 import time
 from email.mime.text import MIMEText
@@ -347,6 +348,29 @@ def upsert_batch(rows: list[list[dict]], stats: dict):
 
 # -------------------- Email --------------------
 
+class _force_ipv4_dns:
+    """Temporarily restrict socket.getaddrinfo to IPv4 results.
+
+    Some container networks (Railway included, in some configurations)
+    have no outbound IPv6 route. If a mail host's DNS returns an IPv6
+    address, Python's socket layer tries it first and fails with
+    'Network is unreachable' (errno 101) before ever attempting IPv4 --
+    smtplib never even reaches the point of trying the port. Restricting
+    getaddrinfo to AF_INET here forces the connection over IPv4 while
+    leaving the hostname itself untouched, so TLS/SNI and certificate
+    validation against the real hostname still work correctly.
+    """
+    def __enter__(self):
+        self._orig = socket.getaddrinfo
+        def _ipv4_only(*args, **kwargs):
+            return [ai for ai in self._orig(*args, **kwargs) if ai[0] == socket.AF_INET]
+        socket.getaddrinfo = _ipv4_only
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        socket.getaddrinfo = self._orig
+        return False
+
 def send_summary_email(stats: dict, failed: bool = False, error_msg: str | None = None):
     if not CONFIG["SMTP_HOST"] or not CONFIG["EMAIL_FROM"]:
         warn("SMTP not configured; skipping email", host_set=bool(CONFIG["SMTP_HOST"]),
@@ -377,7 +401,7 @@ def send_summary_email(stats: dict, failed: bool = False, error_msg: str | None 
     msg["From"] = CONFIG["EMAIL_FROM"]
     msg["To"] = CONFIG["EMAIL_TO"]
 
-    with smtplib.SMTP(CONFIG["SMTP_HOST"], CONFIG["SMTP_PORT"]) as server:
+    with _force_ipv4_dns(), smtplib.SMTP(CONFIG["SMTP_HOST"], CONFIG["SMTP_PORT"], timeout=30) as server:
         server.starttls()
         if CONFIG["SMTP_USER"]:
             server.login(CONFIG["SMTP_USER"], CONFIG["SMTP_PASS"])
